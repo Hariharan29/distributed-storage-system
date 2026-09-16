@@ -219,21 +219,35 @@ This avoids storing identical chunk contents multiple times.
 
 ## Testing
 
-The system has been tested with:
+The repository includes an automated C++17 test suite in `tests/test_main.cpp`,
+integrated with CMake and CTest. It currently contains 19 test cases covering:
 
-- PUT
-- GET
-- DELETE
-- LIST
-- Multi-chunk files
-- SHA-256 deduplication
-- Concurrent chunk uploads
-- Storage-node failure
-- Retrieval after node failure
-- Automatic re-replication
-- Adaptive/hot-chunk replication
-- Persistence across container restarts
-- SQLite schema migration for existing metadata databases
+- SHA-256 known vectors, deterministic hashing, binary data, and file hashing
+- Chunking boundaries, ordering, hashing, and multi-chunk reassembly
+- ChunkStore filesystem write, read, deduplication, and delete behavior
+- SQLite metadata schema and file/chunk round trips
+- Deduplication and shared chunk references
+- Replication-related metadata, including unique locations and healthy-node filtering
+- Access counts, hot-chunk eligibility, node status, and heartbeat metadata
+- Legacy SQLite schema migration
+- Concurrent metadata operations
+- Storage-node hash validation and chunk RPC behavior
+
+Run the automated suite with:
+
+```bash
+cmake -S . -B build-tests -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-tests
+ctest --test-dir build-tests --output-on-failure
+```
+
+The current verified result is 19 test cases with 0 failures.
+
+Full distributed replication, node-failure recovery, automatic re-replication,
+adaptive/hot-chunk replication, and end-to-end PUT/GET/DELETE/LIST behavior are
+validated through the Docker-based system workflow rather than duplicated as
+unit tests. The Docker workflow also covers persistence across container
+restarts and retrieval after a storage-node failure.
 
 ### Node Failure Test
 
