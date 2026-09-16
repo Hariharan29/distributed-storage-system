@@ -1,0 +1,167 @@
+syntax = "proto3";
+
+package metadata;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The MetadataService is the single gRPC service exposed by the metadata server.
+// Clients call it for file operations.
+// Storage nodes call it to register themselves and send heartbeats.
+// ─────────────────────────────────────────────────────────────────────────────
+service MetadataService {
+
+  // ── Client RPCs ────────────────────────────────────────────────────────────
+
+  // Step 1 of PUT: Client tells metadata server about the file it wants to upload.
+  // Returns an upload plan: for each chunk, which storage nodes to write to.
+  rpc InitiateUpload(InitiateUploadRequest) returns (InitiateUploadResponse);
+
+  // Step 2 of PUT: Client reports that all chunks have been successfully written.
+  rpc FinalizeUpload(FinalizeUploadRequest) returns (FinalizeUploadResponse);
+
+  // Step 1 of GET: Client asks for the chunk layout of a file.
+  // Returns an ordered list of chunks with their storage node locations.
+  rpc GetFileInfo(GetFileInfoRequest) returns (GetFileInfoResponse);
+
+  // DELETE: Remove a file's metadata and instruct storage nodes to delete chunks.
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+
+  // LIST: Return all stored files and their sizes.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+
+  // ── Storage Node RPCs ──────────────────────────────────────────────────────
+
+  // Storage nodes call this on startup to register themselves.
+  rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeResponse);
+
+  // Storage nodes call this periodically to prove they are still alive.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for InitiateUpload
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Information about one chunk that the client wants to upload.
+message ChunkInfo {
+  int32  chunk_index  = 1;  // Position of this chunk in the file (0, 1, 2, ...)
+  string sha256       = 2;  // SHA-256 hash of the chunk's raw bytes
+  int64  size_bytes   = 3;  // Size of this chunk in bytes
+}
+
+message InitiateUploadRequest {
+  string            filename         = 1;  // e.g. "report.pdf"
+  int64             total_size_bytes = 2;  // Total file size
+  repeated ChunkInfo chunks          = 3;  // One entry per chunk
+}
+
+// Assignment telling the client exactly which nodes to write a chunk to.
+message ChunkAssignment {
+  string          chunk_id      = 1;  // Unique ID for this chunk (SHA-256 of data)
+  int32           chunk_index   = 2;  // Position in the file
+  repeated string node_addresses = 3; // e.g. ["storage_node1:50051", "storage_node2:50051"]
+  bool            already_exists = 4; // true = dedup hit, skip uploading this chunk
+}
+
+message InitiateUploadResponse {
+  string                  file_id     = 1;  // UUID for the whole file
+  repeated ChunkAssignment assignments = 2;  // One per chunk
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for FinalizeUpload
+// ─────────────────────────────────────────────────────────────────────────────
+
+message ChunkUploadResult {
+  string chunk_id = 1;
+  repeated string stored_node_addresses = 2;
+}
+
+message FinalizeUploadRequest {
+  string file_id = 1;
+  repeated ChunkUploadResult chunk_results = 2;
+}
+
+message FinalizeUploadResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for GetFileInfo
+// ─────────────────────────────────────────────────────────────────────────────
+
+message GetFileInfoRequest {
+  string filename = 1;
+}
+
+// Information about one chunk needed to fetch it.
+message ChunkLocation {
+  string          chunk_id       = 1;
+  int32           chunk_index    = 2;
+  string          sha256         = 3;  // Client verifies integrity after download
+  repeated string node_addresses = 4;  // Try these in order; first healthy one wins
+}
+
+message GetFileInfoResponse {
+  bool                   found           = 1;
+  string                 file_id         = 2;
+  string                 filename        = 3;
+  int64                  total_size_bytes = 4;
+  repeated ChunkLocation chunks          = 5;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for DeleteFile
+// ─────────────────────────────────────────────────────────────────────────────
+
+message DeleteFileRequest {
+  string filename = 1;
+}
+
+message DeleteFileResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for ListFiles
+// ─────────────────────────────────────────────────────────────────────────────
+
+message ListFilesRequest {}  // No parameters needed
+
+message FileEntry {
+  string filename         = 1;
+  int64  total_size_bytes = 2;
+  int32  chunk_count      = 3;
+  string created_at       = 4;
+}
+
+message ListFilesResponse {
+  repeated FileEntry files = 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for RegisterNode
+// ─────────────────────────────────────────────────────────────────────────────
+
+message RegisterNodeRequest {
+  string node_id = 1;  // e.g. "node1"
+  string address = 2;  // e.g. "storage_node1:50051"
+}
+
+message RegisterNodeResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for Heartbeat
+// ─────────────────────────────────────────────────────────────────────────────
+
+message HeartbeatRequest {
+  string node_id = 1;
+}
+
+message HeartbeatResponse {
+  bool   acknowledged = 1;
+}

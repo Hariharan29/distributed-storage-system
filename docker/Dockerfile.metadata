@@ -1,0 +1,74 @@
+# =============================================================================
+# Dockerfile.metadata — Build image for the metadata server
+#
+# This is a multi-stage build:
+#   Stage 1 (builder): Compiles the C++ code inside a container with all
+#                      build tools installed.
+#   Stage 2 (runtime): Copies only the compiled binary into a lean image.
+#                      No compiler, no build tools — just what's needed to run.
+#
+# Python analogy:
+#   Stage 1 = pip install + compile
+#   Stage 2 = the final Docker image you'd deploy
+# =============================================================================
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM ubuntu:22.04 AS builder
+
+# Avoid interactive prompts during apt installs.
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install build dependencies:
+#   cmake, g++        → C++ compiler and build system
+#   libgrpc++-dev     → gRPC C++ library
+#   protobuf-compiler → protoc and grpc_cpp_plugin
+#   libsqlite3-dev    → SQLite3 C library
+#   libssl-dev        → OpenSSL for SHA-256
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    g++ \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
+    libsqlite3-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the source code into the container.
+WORKDIR /src
+COPY . .
+
+# Run CMake to configure and then build only the metadata_server target.
+# -DCMAKE_BUILD_TYPE=Release produces an optimized binary.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --target metadata_server -- -j$(nproc)
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install only the runtime libraries (not the -dev packages).
+RUN apt-get update && apt-get install -y \
+    libgrpc++ \
+    libprotobuf23 \
+    libsqlite3-0 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create the data directory where the SQLite database will live.
+RUN mkdir -p /data
+
+# Copy the compiled binary from the builder stage.
+COPY --from=builder /src/build/metadata_server /usr/local/bin/metadata_server
+
+# ── Environment variable defaults ─────────────────────────────────────────────
+# These can be overridden in docker-compose.yml or at `docker run` time.
+ENV DB_PATH=/data/metadata.db
+ENV METADATA_PORT=50050
+
+EXPOSE 50050
+
+CMD ["metadata_server"]

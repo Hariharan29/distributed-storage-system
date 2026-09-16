@@ -1,0 +1,60 @@
+# =============================================================================
+# Dockerfile.storage — Build image for storage nodes
+#
+# All three storage nodes share this one image.
+# They are differentiated at runtime by environment variables:
+#   NODE_ID       = node1 / node2 / node3
+#   NODE_PORT     = 50051
+#   METADATA_ADDR = metadata_server:50050
+#   DATA_DIR      = /data
+# =============================================================================
+
+# ── Stage 1: Build ────────────────────────────────────────────────────────────
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    g++ \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
+    libsqlite3-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --target storage_node -- -j$(nproc)
+
+# ── Stage 2: Runtime ──────────────────────────────────────────────────────────
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    libgrpc++ \
+    libprotobuf23 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Data directory is mounted as a Docker volume (see docker-compose.yml).
+# This persists chunk files even if the container restarts.
+RUN mkdir -p /data
+
+COPY --from=builder /src/build/storage_node /usr/local/bin/storage_node
+
+# ── Environment variable defaults ─────────────────────────────────────────────
+ENV NODE_ID=node1
+ENV NODE_PORT=50051
+ENV METADATA_ADDR=metadata_server:50050
+ENV DATA_DIR=/data
+
+EXPOSE 50051
+
+CMD ["storage_node"]

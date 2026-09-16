@@ -1,0 +1,144 @@
+# =============================================================================
+# docker-compose.yml
+#
+# Starts:
+#   1 metadata server
+#   3 storage nodes (node1, node2, node3)
+#
+# All services share a Docker bridge network called `storage_net`.
+# Within this network, containers can reach each other by service name:
+#   metadata_server:50050
+#   storage_node1:50051
+#   storage_node2:50051
+#   storage_node3:50051
+#
+# To start everything:
+#   docker compose up --build
+#
+# To stop:
+#   docker compose down
+#
+# To run the client (separate terminal, after services are up):
+#   docker compose run --rm client put /tmp/myfile.pdf
+# =============================================================================
+
+version: "3.9"
+
+services:
+
+  # ── Metadata Server ──────────────────────────────────────────────────────────
+  metadata_server:
+    build:
+      context: .                          # Build from the project root
+      dockerfile: docker/Dockerfile.metadata
+    container_name: metadata_server
+    hostname: metadata_server
+    environment:
+      DB_PATH: /data/metadata.db
+      METADATA_PORT: "50050"
+    volumes:
+      # Persist the SQLite database across container restarts.
+      - metadata_data:/data
+    ports:
+      # Expose port 50050 on the host so the native client can reach it.
+      # Format: "host_port:container_port"
+      - "50050:50050"
+    networks:
+      - storage_net
+    restart: unless-stopped
+
+  # ── Storage Node 1 ───────────────────────────────────────────────────────────
+  storage_node1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.storage
+    container_name: storage_node1
+    hostname: storage_node1          # Used as the address clients connect to.
+    environment:
+      NODE_ID: node1
+      NODE_PORT: "50051"
+      METADATA_ADDR: "metadata_server:50050"
+      DATA_DIR: /data
+    volumes:
+      - node1_data:/data             # Each node gets its own isolated volume.
+    networks:
+      - storage_net
+    depends_on:
+      - metadata_server              # Wait for metadata server to start first.
+    restart: unless-stopped
+
+  # ── Storage Node 2 ───────────────────────────────────────────────────────────
+  storage_node2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.storage
+    container_name: storage_node2
+    hostname: storage_node2
+    environment:
+      NODE_ID: node2
+      NODE_PORT: "50051"
+      METADATA_ADDR: "metadata_server:50050"
+      DATA_DIR: /data
+    volumes:
+      - node2_data:/data
+    networks:
+      - storage_net
+    depends_on:
+      - metadata_server
+    restart: unless-stopped
+
+  # ── Storage Node 3 ───────────────────────────────────────────────────────────
+  storage_node3:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.storage
+    container_name: storage_node3
+    hostname: storage_node3
+    environment:
+      NODE_ID: node3
+      NODE_PORT: "50051"
+      METADATA_ADDR: "metadata_server:50050"
+      DATA_DIR: /data
+    volumes:
+      - node3_data:/data
+    networks:
+      - storage_net
+    depends_on:
+      - metadata_server
+    restart: unless-stopped
+
+  # ── Client (optional, for running inside Docker) ──────────────────────────────
+  # Usage: docker compose run --rm client put /uploads/myfile.pdf
+  client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: client
+    environment:
+      METADATA_ADDR: "metadata_server:50050"
+    volumes:
+      # Mount a local directory into the container so you can upload/download files.
+      - ./uploads:/uploads
+    networks:
+      - storage_net
+    depends_on:
+      - metadata_server
+    profiles:
+      # This service only starts when explicitly requested:
+      #   docker compose run --rm client list
+      # It won't start with `docker compose up`.
+      - client
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+# Docker manages these directories. Data persists across `docker compose down`.
+# To wipe all data: docker compose down -v
+volumes:
+  metadata_data:
+  node1_data:
+  node2_data:
+  node3_data:
+
+# ── Network ───────────────────────────────────────────────────────────────────
+networks:
+  storage_net:
+    driver: bridge

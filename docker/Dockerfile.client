@@ -1,0 +1,47 @@
+# =============================================================================
+# Dockerfile.client — Build image for the CLI client
+#
+# This image lets you run the client from inside Docker if you want,
+# or you can build the client binary locally for native use.
+# =============================================================================
+
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    pkg-config \
+    g++ \
+    libgrpc++-dev \
+    libprotobuf-dev \
+    protobuf-compiler \
+    protobuf-compiler-grpc \
+    libsqlite3-dev \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build build --target client -- -j$(nproc)
+
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y \
+    libgrpc++ \
+    libprotobuf23 \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/build/client /usr/local/bin/client
+
+# The client reads METADATA_ADDR to find the server.
+ENV METADATA_ADDR=metadata_server:50050
+
+# No CMD — the user passes the command (put/get/delete/list) at `docker run` time.
+# Example: docker run --network=... client put /tmp/myfile.pdf
+ENTRYPOINT ["client"]

@@ -1,0 +1,84 @@
+syntax = "proto3";
+
+package storage;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The StorageNodeService is the gRPC service exposed by each storage node.
+// The CLIENT calls StoreChunk and FetchChunk directly.
+// The METADATA SERVER calls CopyChunk and DeleteChunk during re-replication.
+// ─────────────────────────────────────────────────────────────────────────────
+service StorageNodeService {
+
+  // Store a chunk of raw bytes on this node.
+  // Called by the CLIENT during a PUT operation.
+  rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
+
+  // Retrieve a chunk's raw bytes from this node.
+  // Called by the CLIENT during a GET operation.
+  rpc FetchChunk(FetchChunkRequest) returns (FetchChunkResponse);
+
+  // Delete a chunk from this node.
+  // Called by the METADATA SERVER during a DELETE file operation.
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+
+  // Instruct this node to copy one of its chunks to another node.
+  // Called by the METADATA SERVER during re-replication (node failure recovery).
+  // The source node connects to the target node and pushes the chunk data.
+  rpc CopyChunkTo(CopyChunkToRequest) returns (CopyChunkToResponse);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for StoreChunk
+// ─────────────────────────────────────────────────────────────────────────────
+
+message StoreChunkRequest {
+  string chunk_id = 1;  // SHA-256 of the data (used as the filename on disk)
+  bytes  data     = 2;  // Raw chunk bytes (up to 1MB)
+  string sha256   = 3;  // Client-computed hash; storage node verifies this on write
+}
+
+message StoreChunkResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for FetchChunk
+// ─────────────────────────────────────────────────────────────────────────────
+
+message FetchChunkRequest {
+  string chunk_id = 1;
+}
+
+message FetchChunkResponse {
+  bool   found  = 1;
+  bytes  data   = 2;  // Raw chunk bytes
+  string sha256 = 3;  // Hash of returned data; client should verify this
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for DeleteChunk
+// ─────────────────────────────────────────────────────────────────────────────
+
+message DeleteChunkRequest {
+  string chunk_id = 1;
+}
+
+message DeleteChunkResponse {
+  bool   success = 1;
+  string message = 2;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Messages for CopyChunkTo (re-replication)
+// ─────────────────────────────────────────────────────────────────────────────
+
+message CopyChunkToRequest {
+  string chunk_id            = 1;  // Which chunk to copy
+  string target_node_address = 2;  // Where to send it, e.g. "storage_node3:50051"
+}
+
+message CopyChunkToResponse {
+  bool   success = 1;
+  string message = 2;
+}

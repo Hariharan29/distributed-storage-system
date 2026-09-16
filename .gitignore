@@ -1,0 +1,8 @@
+build/
+uploads/*
+*.db
+*.sqllite
+*.log
+.vscode/
+.idea/
+
