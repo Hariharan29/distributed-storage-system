@@ -88,7 +88,7 @@ void StorageClient::put(const std::string& local_filepath) {
     std::vector<std::thread> upload_threads;
     std::mutex               print_mutex;  // Prevents garbled console output.
     std::mutex               results_mutex;
-    std::unordered_map<std::string, std::vector<std::string>> stored_nodes;
+    std::unordered_map<int32_t, std::vector<std::string>> stored_nodes;
 
     for (const auto& assignment : init_resp.assignments()) {
         if (assignment.already_exists()) {
@@ -115,16 +115,23 @@ void StorageClient::put(const std::string& local_filepath) {
 
         const Chunk& chunk = *chunk_ptr;
 
-        upload_threads.emplace_back([this, &chunk, node_addrs, &print_mutex,
-                                     &results_mutex, &stored_nodes]() {
+            const int32_t chunk_index = chunk.index;
+            const std::string chunk_id = chunk.chunk_id;
+            const std::string chunk_sha256 = chunk.sha256;
+            const std::vector<uint8_t> chunk_data = chunk.data;
+
+            // Capture chunk fields by value so the thread does not outlive the loop reference.
+            upload_threads.emplace_back([this, chunk_index, chunk_id, chunk_sha256,
+                                         chunk_data, node_addrs, &print_mutex,
+                                         &results_mutex, &stored_nodes]() {
             std::vector<std::string> successful =
-                uploadChunk(chunk.chunk_id, chunk.data, chunk.sha256, node_addrs);
+                    uploadChunk(chunk_id, chunk_data, chunk_sha256, node_addrs);
             {
                 std::lock_guard<std::mutex> lock(results_mutex);
-                stored_nodes[chunk.chunk_id] = std::move(successful);
+                    stored_nodes[chunk_index] = std::move(successful);
             }
             std::lock_guard<std::mutex> lock(print_mutex);
-            std::cout << "[Client] Chunk " << chunk.index << " upload complete.\n";
+                std::cout << "[Client] Chunk " << chunk_index << " upload complete.\n";
         });
     }
 
@@ -136,9 +143,19 @@ void StorageClient::put(const std::string& local_filepath) {
     // ── Step 4: FinalizeUpload RPC ────────────────────────────────────────────
     metadata::FinalizeUploadRequest fin_req;
     fin_req.set_file_id(init_resp.file_id());
-    for (const auto& [chunk_id, addresses] : stored_nodes) {
+    for (const auto& [chunk_index, addresses] : stored_nodes) {
+        const Chunk* chunk_ptr = nullptr;
+        for (const Chunk& c : chunks) {
+            if (c.index == chunk_index) {
+                chunk_ptr = &c;
+                break;
+            }
+        }
+        if (!chunk_ptr) continue;
+
         auto* result = fin_req.add_chunk_results();
-        result->set_chunk_id(chunk_id);
+        result->set_chunk_index(chunk_index);
+        result->set_chunk_id(chunk_ptr->chunk_id);
         for (const std::string& address : addresses) {
             result->add_stored_node_addresses(address);
         }

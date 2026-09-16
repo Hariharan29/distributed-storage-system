@@ -72,8 +72,9 @@ message InitiateUploadResponse {
 // ─────────────────────────────────────────────────────────────────────────────
 
 message ChunkUploadResult {
-  string chunk_id = 1;
-  repeated string stored_node_addresses = 2;
+  int32  chunk_index = 1;
+  string chunk_id    = 2;
+  repeated string stored_node_addresses = 3;
 }
 
 message FinalizeUploadRequest {

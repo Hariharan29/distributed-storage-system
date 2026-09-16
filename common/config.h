@@ -48,6 +48,14 @@ namespace config {
     // How often (in seconds) the HeartbeatMonitor runs the adaptive replication check.
     constexpr int ADAPTIVE_REPLICATION_INTERVAL_SECONDS = 60;
 
+    // How long gRPC calls should wait before failing.
+    constexpr int DEFAULT_GRPC_TIMEOUT_SECONDS = 10;
+    constexpr int REPLICATION_GRPC_TIMEOUT_SECONDS = 5;
+    constexpr int HEARTBEAT_GRPC_TIMEOUT_SECONDS = 3;
+
+    // Width of the hot-chunk access window used for adaptive replication.
+    constexpr int HOT_CHUNK_ACCESS_WINDOW_SECONDS = 60;
+
     // ── Network ───────────────────────────────────────────────────────────────
 
     // Default port the metadata server listens on.

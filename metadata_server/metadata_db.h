@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <sqlite3.h>
 #include <string>
@@ -37,6 +38,13 @@ public:
     explicit MetadataDB(const std::string& db_path);
     ~MetadataDB();
 
+    sqlite3* dbHandle() const { return db_; }
+
+    void beginTransaction();
+    void commitTransaction();
+    void rollbackTransaction();
+    void reconcileMetadata();
+
     void insertFile(const std::string& file_id, const std::string& filename,
                     int64_t total_size_bytes, int32_t chunk_count,
                     int32_t replication_factor);
@@ -70,7 +78,8 @@ public:
 
 private:
     sqlite3* db_ = nullptr;
-    std::mutex mutex_;
+    std::recursive_mutex mutex_;
+    std::unique_ptr<std::lock_guard<std::recursive_mutex>> tx_guard_;
 
     void createTables();
     void exec(const char* sql);

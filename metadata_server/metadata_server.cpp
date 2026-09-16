@@ -57,67 +57,75 @@ grpc::Status MetadataServiceImpl::InitiateUpload(
 
     std::string filename = request->filename();
 
-    // Reject if this filename already exists.
     FileRecord existing = db_.getFile(filename);
     if (existing.found) {
         return grpc::Status(grpc::StatusCode::ALREADY_EXISTS,
                             "File already exists: " + filename);
     }
 
-    if (static_cast<int>(db_.getAliveNodes().size()) < config::DEFAULT_REPLICATION_FACTOR) {
+    const int alive_nodes = static_cast<int>(db_.getAliveNodes().size());
+    if (alive_nodes < config::DEFAULT_REPLICATION_FACTOR) {
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                            "Required replication factor cannot be satisfied");
+                            "Required replication factor cannot be satisfied (available nodes: " +
+                            std::to_string(alive_nodes) + ")");
     }
 
     std::string file_id = generateId();
+    db_.beginTransaction();
 
-    // Insert the file record (no chunk data yet — it's added below).
-    db_.insertFile(file_id,
-                   filename,
-                   request->total_size_bytes(),
-                   request->chunks_size(),
-                   config::DEFAULT_REPLICATION_FACTOR);
+    try {
+        db_.insertFile(file_id,
+                       filename,
+                       request->total_size_bytes(),
+                       request->chunks_size(),
+                       config::DEFAULT_REPLICATION_FACTOR);
 
-    response->set_file_id(file_id);
+        response->set_file_id(file_id);
 
-    // For each chunk the client described, decide where to store it.
-    for (const metadata::ChunkInfo& chunk_info : request->chunks()) {
-        auto* assignment = response->add_assignments();
-        assignment->set_chunk_index(chunk_info.chunk_index());
+        for (const metadata::ChunkInfo& chunk_info : request->chunks()) {
+            auto* assignment = response->add_assignments();
+            assignment->set_chunk_index(chunk_info.chunk_index());
 
-        // ── Deduplication check ───────────────────────────────────────────────
-        // chunk_id = SHA-256 of the chunk data (sent by the client)
-        std::string chunk_id = chunk_info.sha256();  // SHA-256 IS the chunk_id
-        assignment->set_chunk_id(chunk_id);
+            std::string chunk_id = chunk_info.sha256();
+            assignment->set_chunk_id(chunk_id);
 
-        std::string existing_chunk = db_.findChunkBySha256(chunk_info.sha256());
-        if (!existing_chunk.empty()) {
-            // A chunk with identical content already exists on some nodes.
-            // Tell the client to skip uploading this chunk (dedup hit).
-            assignment->set_already_exists(true);
+            std::string existing_chunk = db_.findChunkBySha256(chunk_info.sha256());
+            if (!existing_chunk.empty()) {
+                assignment->set_already_exists(true);
+                db_.addFileChunk(file_id, existing_chunk, chunk_info.chunk_index());
 
-            db_.addFileChunk(file_id, existing_chunk, chunk_info.chunk_index());
+                for (const std::string& node_id : db_.getNodesHoldingChunk(existing_chunk)) {
+                    NodeRecord node = db_.getNode(node_id);
+                    if (node.is_alive) {
+                        assignment->add_node_addresses(node.address);
+                    }
+                }
 
-            std::cout << "[MetadataServer] Dedup hit for chunk " << chunk_id << "\n";
-            continue;
+                std::cout << "[MetadataServer] Dedup hit for chunk " << chunk_id << "\n";
+                continue;
+            }
+
+            assignment->set_already_exists(false);
+
+            std::vector<NodeRecord> chosen = pickNodes(config::DEFAULT_REPLICATION_FACTOR);
+            if (static_cast<int>(chosen.size()) < config::DEFAULT_REPLICATION_FACTOR) {
+                throw std::runtime_error("Required replication factor cannot be satisfied for chunk " + chunk_id +
+                                         " (available nodes: " + std::to_string(chosen.size()) + ")");
+            }
+
+            db_.insertChunk(chunk_id, chunk_info.sha256(), chunk_info.size_bytes());
+            db_.addFileChunk(file_id, chunk_id, chunk_info.chunk_index());
+
+            for (const NodeRecord& node : chosen) {
+                assignment->add_node_addresses(node.address);
+            }
         }
 
-        assignment->set_already_exists(false);
-
-        // ── Node selection ────────────────────────────────────────────────────
-        // Pick DEFAULT_REPLICATION_FACTOR distinct nodes for this chunk.
-        std::vector<NodeRecord> chosen = pickNodes(config::DEFAULT_REPLICATION_FACTOR);
-        if (static_cast<int>(chosen.size()) != config::DEFAULT_REPLICATION_FACTOR) {
-            return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                                "Required replication factor cannot be satisfied");
-        }
-
-        db_.insertChunk(chunk_id, chunk_info.sha256(), chunk_info.size_bytes());
-        db_.addFileChunk(file_id, chunk_id, chunk_info.chunk_index());
-
-        for (const NodeRecord& node : chosen) {
-            assignment->add_node_addresses(node.address);
-        }
+        db_.commitTransaction();
+    } catch (const std::exception& ex) {
+        db_.rollbackTransaction();
+        return grpc::Status(grpc::StatusCode::INTERNAL,
+                            std::string("Upload initialization failed: ") + ex.what());
     }
 
     std::cout << "[MetadataServer] Initiated upload for file '" << filename
@@ -136,16 +144,32 @@ grpc::Status MetadataServiceImpl::FinalizeUpload(
     metadata::FinalizeUploadResponse*      response) {
 
     const std::vector<ChunkRecord> chunks = db_.getChunksForFile(request->file_id());
-    if (chunks.empty() && request->file_id().empty()) {
+    if (chunks.empty()) {
         response->set_success(false);
         response->set_message("Unknown upload.");
         return grpc::Status::OK;
     }
 
-    std::unordered_map<std::string, std::vector<std::string>> stored_addresses;
+    std::unordered_map<int32_t, std::vector<std::string>> stored_addresses;
     for (const auto& result : request->chunk_results()) {
-        stored_addresses[result.chunk_id()] = {result.stored_node_addresses().begin(),
-                                               result.stored_node_addresses().end()};
+        stored_addresses[result.chunk_index()] = {result.stored_node_addresses().begin(),
+                                                 result.stored_node_addresses().end()};
+    }
+
+    for (const ChunkRecord& chunk : chunks) {
+        auto it = stored_addresses.find(chunk.chunk_index);
+        if (it == stored_addresses.end() || it->second.empty()) {
+            std::vector<std::string> existing_nodes;
+            for (const std::string& node_id : db_.getNodesHoldingChunk(chunk.chunk_id)) {
+                NodeRecord node = db_.getNode(node_id);
+                if (node.is_alive) {
+                    existing_nodes.push_back(node.address);
+                }
+            }
+            if (!existing_nodes.empty()) {
+                stored_addresses[chunk.chunk_index] = std::move(existing_nodes);
+            }
+        }
     }
 
     const std::vector<NodeRecord> alive_nodes = db_.getAliveNodes();
@@ -153,16 +177,25 @@ grpc::Status MetadataServiceImpl::FinalizeUpload(
     for (const NodeRecord& node : alive_nodes) node_by_address[node.address] = node.node_id;
 
     for (const ChunkRecord& chunk : chunks) {
-        for (const std::string& address : stored_addresses[chunk.chunk_id]) {
-            const auto it = node_by_address.find(address);
-            if (it != node_by_address.end()) db_.addChunkLocation(chunk.chunk_id, it->second);
+        const auto it = stored_addresses.find(chunk.chunk_index);
+        if (it == stored_addresses.end()) {
+            continue;
+        }
+        for (const std::string& address : it->second) {
+            const auto node_it = node_by_address.find(address);
+            if (node_it != node_by_address.end()) {
+                db_.addChunkLocation(chunk.chunk_id, node_it->second);
+            }
         }
     }
 
     bool complete = true;
     for (const ChunkRecord& chunk : chunks) {
-        if (static_cast<int>(db_.getNodesHoldingChunk(chunk.chunk_id).size()) <
-            config::DEFAULT_REPLICATION_FACTOR) {
+        const int replica_count = static_cast<int>(db_.getNodesHoldingChunk(chunk.chunk_id).size());
+        if (replica_count < config::DEFAULT_REPLICATION_FACTOR) {
+            std::cerr << "[MetadataServer] Chunk " << chunk.chunk_id
+                      << " finalization incomplete: " << replica_count << "/"
+                      << config::DEFAULT_REPLICATION_FACTOR << " replicas active.\n";
             complete = false;
             break;
         }
@@ -218,6 +251,31 @@ grpc::Status MetadataServiceImpl::GetFileInfo(
 
         // Get the addresses of all healthy nodes holding this chunk.
         std::vector<std::string> node_ids = db_.getNodesHoldingChunk(chunk.chunk_id);
+
+        if (node_ids.empty()) {
+            for (const NodeRecord& node : db_.getAliveNodes()) {
+                auto channel = grpc::CreateChannel(node.address,
+                                                   grpc::InsecureChannelCredentials());
+                auto stub = storage::StorageNodeService::NewStub(channel);
+
+                storage::FetchChunkRequest fetch_request;
+                fetch_request.set_chunk_id(chunk.chunk_id);
+                storage::FetchChunkResponse fetch_response;
+                grpc::ClientContext fetch_context;
+                fetch_context.set_deadline(std::chrono::system_clock::now() +
+                                           std::chrono::seconds(5));
+
+                grpc::Status fetch_status = stub->FetchChunk(
+                    &fetch_context, fetch_request, &fetch_response);
+                if (!fetch_status.ok() || !fetch_response.found() ||
+                    fetch_response.sha256() != chunk.sha256) {
+                    continue;
+                }
+
+                db_.addChunkLocation(chunk.chunk_id, node.node_id);
+            }
+            node_ids = db_.getNodesHoldingChunk(chunk.chunk_id);
+        }
 
         auto* loc = response->add_chunks();
         loc->set_chunk_id(chunk.chunk_id);
@@ -300,9 +358,24 @@ grpc::Status MetadataServiceImpl::RegisterNode(
     const metadata::RegisterNodeRequest* request,
     metadata::RegisterNodeResponse*      response) {
 
-    db_.upsertNode(request->node_id(), request->address());
+    const std::string node_id = request->node_id();
+    const std::string address = request->address();
+    if (node_id.empty() || address.empty() || address.find(':') == std::string::npos) {
+        response->set_success(false);
+        response->set_message("Invalid node registration: node_id and address are required.");
+        return grpc::Status::OK;
+    }
+
+    NodeRecord existing = db_.getNode(node_id);
+    if (!existing.node_id.empty() && existing.address != address) {
+        response->set_success(false);
+        response->set_message("Node ID already registered to a different address.");
+        return grpc::Status::OK;
+    }
+
+    db_.upsertNode(node_id, address);
     std::cout << "[MetadataServer] Registered node: "
-              << request->node_id() << " at " << request->address() << "\n";
+              << node_id << " at " << address << "\n";
 
     response->set_success(true);
     response->set_message("Node registered.");

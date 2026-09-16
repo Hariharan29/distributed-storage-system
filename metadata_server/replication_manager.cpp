@@ -23,6 +23,7 @@
 #include <iostream>
 #include <algorithm>  // std::find
 #include <chrono>
+#include <thread>
 
 ReplicationManager::ReplicationManager(MetadataDB& db) : db_(db) {}
 
@@ -34,58 +35,53 @@ ReplicationManager::ReplicationManager(MetadataDB& db) : db_(db) {}
 void ReplicationManager::handleNodeFailure(const std::string& failed_node_id) {
     std::cout << "[ReplicationManager] Node failed: " << failed_node_id << "\n";
 
-    // Step 1: Find every chunk that was stored on the failed node.
     std::vector<std::string> affected_chunks = db_.getChunksOnNode(failed_node_id);
     std::cout << "[ReplicationManager] " << affected_chunks.size()
               << " chunks affected.\n";
 
-    // Step 2: Mark the node as dead in the DB.
     db_.updateNodeStatus(failed_node_id, false);
 
-    // Step 3: For each affected chunk, check if we need to re-replicate.
     for (const std::string& chunk_id : affected_chunks) {
-        // Remove the dead node from this chunk's location list.
         db_.removeChunkLocation(chunk_id, failed_node_id);
 
-        // Count remaining healthy replicas for this chunk.
         std::vector<std::string> healthy_nodes = db_.getNodesHoldingChunk(chunk_id);
         int current_replicas = static_cast<int>(healthy_nodes.size());
 
-        // We always aim for DEFAULT_REPLICATION_FACTOR replicas.
-        // (Hot chunks will be promoted separately by promoteHotChunks().)
-        if (current_replicas < config::DEFAULT_REPLICATION_FACTOR) {
-            std::cout << "[ReplicationManager] Chunk " << chunk_id
-                      << " under-replicated (" << current_replicas << "/"
-                      << config::DEFAULT_REPLICATION_FACTOR << "). Re-replicating...\n";
+        if (current_replicas >= config::DEFAULT_REPLICATION_FACTOR) {
+            continue;
+        }
 
-            if (healthy_nodes.empty()) {
-                std::cerr << "[ReplicationManager] WARNING: No healthy replica exists "
-                          << "for chunk " << chunk_id << ". Data may be lost!\n";
-                continue;
-            }
+        std::cout << "[ReplicationManager] Chunk " << chunk_id
+                  << " under-replicated (" << current_replicas << "/"
+                  << config::DEFAULT_REPLICATION_FACTOR << ").\n";
 
-            // Pick a target node that doesn't already have the chunk.
-            std::string target = pickTargetNode(chunk_id);
-            if (target.empty()) {
-                std::cerr << "[ReplicationManager] No suitable target node for chunk "
-                          << chunk_id << ".\n";
-                continue;
-            }
+        if (healthy_nodes.empty()) {
+            std::cerr << "[ReplicationManager] DATA LOSS: no healthy replica exists for chunk "
+                      << chunk_id << ". Re-replication impossible.\n";
+            continue;
+        }
 
-            // Get the address of a healthy source node.
-            NodeRecord source_node = db_.getNode(healthy_nodes[0]);
+        std::string target = pickTargetNode(chunk_id);
+        if (target.empty()) {
+            std::cerr << "[ReplicationManager] DATA LOSS: no suitable target for chunk "
+                      << chunk_id << ".\n";
+            continue;
+        }
 
-            bool ok = replicateChunk(chunk_id, source_node.address, target);
-            if (ok) {
-                // Find the target node's ID from its address so we can update the DB.
-                for (const NodeRecord& nr : db_.getAliveNodes()) {
-                    if (nr.address == target) {
-                        db_.addChunkLocation(chunk_id, nr.node_id);
-                        std::cout << "[ReplicationManager] Chunk " << chunk_id
-                                  << " successfully replicated to " << nr.node_id << "\n";
-                        break;
-                    }
-                }
+        NodeRecord source_node = db_.getNode(healthy_nodes[0]);
+        bool ok = replicateChunk(chunk_id, source_node.address, target);
+        if (!ok) {
+            std::cerr << "[ReplicationManager] Re-replication failed for chunk "
+                      << chunk_id << ". Replica count remains degraded.\n";
+            continue;
+        }
+
+        for (const NodeRecord& nr : db_.getAliveNodes()) {
+            if (nr.address == target) {
+                db_.addChunkLocation(chunk_id, nr.node_id);
+                std::cout << "[ReplicationManager] Chunk " << chunk_id
+                          << " successfully replicated to " << nr.node_id << "\n";
+                break;
             }
         }
     }
@@ -152,35 +148,36 @@ void ReplicationManager::promoteHotChunks() {
 bool ReplicationManager::replicateChunk(const std::string& chunk_id,
                                          const std::string& source_node_address,
                                          const std::string& target_node_address) {
-    // Create a gRPC channel to the source node.
-    // Think of this like opening a connection in Python: grpc.insecure_channel(addr)
-    auto channel = grpc::CreateChannel(source_node_address,
-                                       grpc::InsecureChannelCredentials());
-    auto stub = storage::StorageNodeService::NewStub(channel);
+    const int max_attempts = 3;
+    for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+        auto channel = grpc::CreateChannel(source_node_address,
+                                           grpc::InsecureChannelCredentials());
+        auto stub = storage::StorageNodeService::NewStub(channel);
 
-    storage::CopyChunkToRequest request;
-    request.set_chunk_id(chunk_id);
-    request.set_target_node_address(target_node_address);
+        storage::CopyChunkToRequest request;
+        request.set_chunk_id(chunk_id);
+        request.set_target_node_address(target_node_address);
 
-    storage::CopyChunkToResponse response;
-    grpc::ClientContext context;
-    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+        storage::CopyChunkToResponse response;
+        grpc::ClientContext context;
+        context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(config::REPLICATION_GRPC_TIMEOUT_SECONDS));
 
-    grpc::Status status = stub->CopyChunkTo(&context, request, &response);
+        grpc::Status status = stub->CopyChunkTo(&context, request, &response);
 
-    if (!status.ok()) {
-        std::cerr << "[ReplicationManager] CopyChunkTo RPC failed for chunk "
-                  << chunk_id << ": " << status.error_message() << "\n";
-        return false;
+        if (status.ok() && response.success()) {
+            return true;
+        }
+
+        std::cerr << "[ReplicationManager] CopyChunkTo attempt " << attempt
+                  << "/" << max_attempts << " failed for chunk " << chunk_id
+                  << ": " << (status.ok() ? response.message() : status.error_message()) << "\n";
+
+        if (attempt < max_attempts) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200 * attempt));
+        }
     }
 
-    if (!response.success()) {
-        std::cerr << "[ReplicationManager] CopyChunkTo returned failure for chunk "
-                  << chunk_id << ": " << response.message() << "\n";
-        return false;
-    }
-
-    return true;
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
