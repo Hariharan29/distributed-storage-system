@@ -88,13 +88,24 @@ void setSchemaVersion(sqlite3* db, int version) {
     sqlite3_finalize(stmt);
 }
 
+void execRaw(sqlite3* db, const char* sql) {
+    char* error = nullptr;
+    const int result = sqlite3_exec(db, sql, nullptr, nullptr, &error);
+    if (result != SQLITE_OK) {
+        std::string message = error ? error : "SQLite migration failed";
+        sqlite3_free(error);
+        throw std::runtime_error(message);
+    }
+}
+
 void applySchemaMigrations(sqlite3* db) {
     ensureVersionTable(db);
     const int version = getSchemaVersion(db);
 
     if (version < 1) {
         ensureColumn(db, "chunks", "access_count", "INTEGER DEFAULT 0");
-        ensureColumn(db, "chunks", "last_accessed", "TEXT DEFAULT CURRENT_TIMESTAMP");
+        ensureColumn(db, "chunks", "last_accessed", "TEXT");
+        execRaw(db, "UPDATE chunks SET last_accessed = CURRENT_TIMESTAMP WHERE last_accessed IS NULL;");
         setSchemaVersion(db, 1);
     }
 }

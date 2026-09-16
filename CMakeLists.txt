@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(distributed_storage CXX)
 
+enable_testing()
+
 # ── C++ Standard ──────────────────────────────────────────────────────────────
 # C++17 gives us std::filesystem, std::optional, and other modern features.
 set(CMAKE_CXX_STANDARD 17)
@@ -159,3 +161,26 @@ target_link_libraries(client PRIVATE
     common_lib
     gRPC::grpc++
 )
+
+# ── Automated tests ──────────────────────────────────────────────────────────
+# Tests link the production component implementations directly and use only
+# temporary files and SQLite databases. Networked replication and full Docker
+# workflows remain covered by the existing compose smoke tests.
+add_executable(distributed_storage_tests
+    tests/test_main.cpp
+    client/chunker.cpp
+    metadata_server/metadata_db.cpp
+    storage_node/chunk_store.cpp
+    storage_node/storage_node_server.cpp
+)
+target_include_directories(distributed_storage_tests PRIVATE
+    ${CMAKE_SOURCE_DIR}
+    ${PROTO_GEN_DIR}
+)
+target_link_libraries(distributed_storage_tests PRIVATE
+    proto_lib
+    common_lib
+    SQLite::SQLite3
+    gRPC::grpc++
+)
+add_test(NAME distributed_storage_tests COMMAND distributed_storage_tests)
