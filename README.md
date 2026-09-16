@@ -1,73 +1,324 @@
 # Fault-Tolerant Distributed Storage System
 
-A small educational distributed file storage system written in C++.
+A fault-tolerant distributed file storage system built in C++17 using gRPC, Protobuf, SQLite, and Docker. Files are split into chunks, replicated across storage nodes, and automatically recovered when a storage node fails.
 
 ## Features
 
-- **Chunked storage**: Files are split into 1MB chunks.
-- **Replication**: Each chunk is stored on 2 storage nodes (default).
-- **SHA-256 deduplication**: Identical chunks are stored only once.
-- **Failure detection**: Heartbeat-based; dead nodes detected in ~15 seconds.
-- **Re-replication**: Chunks on dead nodes are automatically repaired.
-- **Adaptive replication**: Hot chunks (≥10 accesses) are promoted to 3 replicas.
-- **Concurrent uploads**: Chunks are uploaded to nodes in parallel.
+- **Chunked storage**: Files are split into 1 MiB chunks.
+- **Replication**: Each chunk is normally stored on 2 storage nodes.
+- **SHA-256 content addressing**: The SHA-256 hash of chunk contents is used as the chunk ID and filename on disk.
+- **Deduplication**: Identical chunks are stored only once and can be referenced by multiple files.
+- **Failure detection**: Storage nodes send heartbeats; nodes that stop responding are detected after the configured timeout.
+- **Automatic re-replication**: Chunks affected by a failed node are copied to healthy nodes to restore the desired replication factor.
+- **Adaptive replication**: Frequently accessed chunks can be promoted from 2 to 3 replicas.
+- **Concurrent uploads**: Independent chunks are uploaded to storage nodes in parallel.
+- **Metadata/data separation**: SQLite stores metadata while actual chunk data remains on storage nodes.
+- **Dockerized deployment**: Docker Compose runs the metadata server and three storage nodes.
 
 ## Architecture
 
+```text
+                         ┌─────────────────────┐
+                         │      CLI Client     │
+                         └──────────┬──────────┘
+                                    │
+                             gRPC metadata
+                                    │
+                         ┌──────────▼──────────┐
+                         │   Metadata Server   │
+                         │      SQLite DB       │
+                         │                     │
+                         │ Heartbeat Monitor   │
+                         │ Replication Manager │
+                         └──────────┬──────────┘
+                                    │
+                              Control / Metadata
+                                    │
+              ┌─────────────────────┼─────────────────────┐
+              │                     │                     │
+         ┌────▼─────┐          ┌────▼─────┐          ┌────▼─────┐
+         │ Storage  │          │ Storage  │          │ Storage  │
+         │  Node 1  │          │  Node 2  │          │  Node 3  │
+         │  /data   │          │  /data   │          │  /data   │
+         └──────────┘          └──────────┘          └──────────┘
+              ▲                     ▲                     ▲
+              └──────────── Direct chunk transfers ──────┘
+                              from Client
 ```
-Client ──► Metadata Server (SQLite)
-  │              │
-  │         Heartbeat Monitor
-  │         Replication Manager
-  │
-  └──► Storage Node 1  (/data)
-  └──► Storage Node 2  (/data)
-  └──► Storage Node 3  (/data)
+
+### Component Responsibilities
+
+| Component | Responsibility |
+|---|---|
+| **CLI Client** | File chunking, PUT/GET/DELETE/LIST, direct chunk transfers |
+| **Metadata Server** | File/chunk metadata, replica locations, node state, upload coordination |
+| **SQLite** | Persistent metadata storage |
+| **Storage Nodes** | Store and retrieve chunk files |
+| **Heartbeat Monitor** | Detect unavailable storage nodes |
+| **Replication Manager** | Re-replicate chunks and promote hot chunks |
+| **gRPC + Protobuf** | Communication between client, metadata server, and storage nodes |
+| **Docker Compose** | Runs the complete distributed system locally |
+
+## Design Highlights
+
+### Metadata and data separation
+
+The metadata server stores information such as:
+
+- File records
+- Chunk records
+- File-to-chunk relationships
+- Chunk-to-node locations
+- Storage-node status
+- Chunk access counts
+
+Actual chunk contents are stored as files on the storage nodes.
+
+### Content-addressed chunks
+
+Each chunk is identified by:
+
+```text
+chunk_id = SHA-256(chunk data)
+```
+
+The same hash is also used as the chunk filename on the storage node.
+
+This allows identical chunk contents to be recognized and reused.
+
+### Replication
+
+The default replication factor is 2. The metadata server selects healthy storage nodes for each chunk and tracks their locations in SQLite.
+
+If a node fails, the replication manager restores missing replicas when healthy nodes are available.
+
+## PUT Flow
+
+```text
+1. Client reads the input file
+          ↓
+2. File is split into 1 MiB chunks
+          ↓
+3. SHA-256 is calculated for each chunk
+          ↓
+4. Client sends chunk metadata to Metadata Server
+          ↓
+5. Metadata Server selects storage nodes
+          ↓
+6. Client uploads chunks directly to Storage Nodes
+          ↓
+7. Successful storage locations are recorded
+          ↓
+8. File metadata is finalized
+```
+
+Independent chunk uploads are performed concurrently.
+
+## GET Flow
+
+```text
+1. Client requests file metadata
+          ↓
+2. Metadata Server returns ordered chunk information
+          ↓
+3. Client retrieves each chunk from a healthy replica
+          ↓
+4. Chunks are reassembled in index order
+          ↓
+5. Result is written to the requested output path
+```
+
+The client can try another replica if a storage node is unavailable.
+
+## Fault Tolerance
+
+### Node failure → re-replication
+
+```text
+             Before failure
+
+        Node 1 ───── Chunk A
+        Node 2 ───── Chunk A
+        Node 3
+
+
+             Node 1 fails
+                  ↓
+
+        Node 2 ───── Chunk A
+        Node 3
+
+
+          Heartbeat timeout
+                  ↓
+        Heartbeat Monitor
+                  ↓
+        Replication Manager
+                  ↓
+        Node 2 ─────────────► Node 3
+                  CopyChunkTo
+                  ↓
+
+        Node 2 ───── Chunk A
+        Node 3 ───── Chunk A
+```
+
+The recovery process is:
+
+1. Storage node stops sending heartbeats.
+2. After the configured timeout, `HeartbeatMonitor` marks the node as unavailable.
+3. `ReplicationManager.handleNodeFailure()` identifies affected chunks.
+4. Dead-node locations are removed from the metadata.
+5. Under-replicated chunks are copied from a healthy source to a healthy target using `CopyChunkTo` gRPC.
+6. The new replica location is recorded in SQLite.
+
+The system therefore continues serving files when another healthy replica exists.
+
+## Adaptive Replication
+
+Frequently accessed chunks can receive an additional replica.
+
+```text
+Normal chunk:
+
+Node 1 ── Chunk A
+Node 2 ── Chunk A
+
+             ↓
+       Access count reaches
+       configured hot threshold
+
+             ↓
+
+Node 1 ── Chunk A
+Node 2 ── Chunk A
+Node 3 ── Chunk A
+```
+
+The metadata server tracks chunk access information. The replication manager periodically checks for hot chunks and promotes eligible chunks to the configured hot replication factor.
+
+## SHA-256 Deduplication
+
+During a PUT:
+
+1. The client calculates the SHA-256 hash of every chunk.
+2. The metadata server checks whether that chunk already exists.
+3. If the chunk already exists, the physical chunk does not need to be uploaded again.
+4. The new file is associated with the existing chunk metadata.
+
+For example:
+
+```text
+File A → Chunk X
+File B → Chunk X
+             │
+             └── one physical copy of Chunk X per replica
+```
+
+This avoids storing identical chunk contents multiple times.
+
+## Testing
+
+The system has been tested with:
+
+- PUT
+- GET
+- DELETE
+- LIST
+- Multi-chunk files
+- SHA-256 deduplication
+- Concurrent chunk uploads
+- Storage-node failure
+- Retrieval after node failure
+- Automatic re-replication
+- Adaptive/hot-chunk replication
+- Persistence across container restarts
+- SQLite schema migration for existing metadata databases
+
+### Node Failure Test
+
+A storage node containing replicas of `bigfile.bin` was stopped during testing.
+
+The remaining storage node successfully served all 5 logical chunks:
+
+```text
+[Client] File has 5 chunk(s).
+[Client] Chunk 0 fetched from storage_node2:50051
+[Client] Chunk 1 fetched from storage_node2:50051
+[Client] Chunk 2 fetched from storage_node2:50051
+[Client] Chunk 3 fetched from storage_node2:50051
+[Client] Chunk 4 fetched from storage_node2:50051
+[Client] File saved to: /uploads/failure_test.bin
+```
+
+The reconstructed file was compared against the original using a binary comparison:
+
+```text
+FC: no differences encountered
 ```
 
 ## Prerequisites
 
-- Docker Desktop (for Docker build)
-- OR: CMake 3.16+, g++, gRPC, OpenSSL, SQLite3 (for local build)
+### Docker
 
----
+- Docker Desktop with Docker Compose
+
+### Local build
+
+- CMake 3.16+
+- C++17 compiler
+- gRPC C++
+- Protobuf
+- OpenSSL
+- SQLite3
 
 ## Quick Start with Docker
 
 ```bash
-# 1. Clone / enter the project directory
+# 1. Clone the repository and enter the project directory
+git clone <repository-url>
 cd distributed_storage
 
-# 2. Build and start all services (metadata server + 3 storage nodes)
+# 2. Build and start all services
+#    metadata server + 3 storage nodes
 docker compose up --build
+```
 
-# 3. In a new terminal — upload a file
+Keep the Compose process running. Open a **new terminal** for client commands.
+
+Put files you want to upload in the project's `uploads/` directory. The directory is mounted into the client container as `/uploads`.
+
+```bash
+# Upload a file
 docker compose run --rm client put /uploads/myfile.pdf
 
-# 4. List all stored files
+# List stored files
 docker compose run --rm client list
 
-# 5. Download a file
+# Download a file
 docker compose run --rm client get myfile.pdf /uploads/downloaded.pdf
 
-# 6. Delete a file
+# Delete a file
 docker compose run --rm client delete myfile.pdf
+```
 
-# 7. Stop everything
+Stop the services:
+
+```bash
 docker compose down
+```
 
-# 8. Stop everything AND delete all stored data
+Stop the services and remove their Docker volumes, including stored metadata and chunk data:
+
+```bash
 docker compose down -v
 ```
 
-> **Tip:** Put files you want to upload in the `./uploads/` directory —
-> it is mounted into the client container at `/uploads/`.
+> **Warning:** `docker compose down -v` deletes the persistent Docker volumes used by the metadata server and storage nodes.
 
----
+## Local Build Without Docker
 
-## Local Build (without Docker)
-
-### Install dependencies (Ubuntu/Debian)
+### Install dependencies on Ubuntu/Debian
 
 ```bash
 sudo apt-get install -y \
@@ -85,85 +336,90 @@ cmake --build build -- -j$(nproc)
 ```
 
 Binaries are created at:
-- `build/metadata_server`
-- `build/storage_node`
-- `build/client`
 
-### Run locally (4 terminals)
+```text
+build/metadata_server
+build/storage_node
+build/client
+```
 
-**Terminal 1 — Metadata server:**
+### Run locally
+
+Run the metadata server first:
+
 ```bash
 DB_PATH=./metadata.db ./build/metadata_server
 ```
 
-**Terminal 2 — Storage node 1:**
+Run three storage nodes in separate terminals:
+
 ```bash
 NODE_ID=node1 NODE_PORT=50051 METADATA_ADDR=localhost:50050 \
     DATA_DIR=./data/node1 HOSTNAME=localhost ./build/storage_node
 ```
 
-**Terminal 3 — Storage node 2:**
 ```bash
 NODE_ID=node2 NODE_PORT=50052 METADATA_ADDR=localhost:50050 \
     DATA_DIR=./data/node2 HOSTNAME=localhost ./build/storage_node
 ```
 
-**Terminal 4 — Client:**
+```bash
+NODE_ID=node3 NODE_PORT=50053 METADATA_ADDR=localhost:50050 \
+    DATA_DIR=./data/node3 HOSTNAME=localhost ./build/storage_node
+```
+
+Run the client:
+
 ```bash
 METADATA_ADDR=localhost:50050 ./build/client list
 METADATA_ADDR=localhost:50050 ./build/client put ./myfile.pdf
 METADATA_ADDR=localhost:50050 ./build/client get myfile.pdf ./out.pdf
+METADATA_ADDR=localhost:50050 ./build/client delete myfile.pdf
 ```
 
-> **Note for local multi-node runs:** When running multiple nodes locally
-> (not in Docker), each node must listen on a different port. Set
-> `HOSTNAME=localhost` and use different `NODE_PORT` values. The node
-> registers its own address with the metadata server using `hostname:port`.
-
----
+> **Note:** When running multiple storage nodes locally, each node must use a different `NODE_PORT`. Set `HOSTNAME=localhost` so nodes register reachable local addresses with the metadata server.
 
 ## Configuration
 
-All constants are in [`common/config.h`](common/config.h).
-Change values there and rebuild — no other file needs to change.
+All configuration constants are defined in [`common/config.h`](common/config.h).
 
 | Constant | Default | Description |
-|---|---|---|
-| `CHUNK_SIZE_BYTES` | 1 MB | File chunk size |
+|---|---:|---|
+| `CHUNK_SIZE_BYTES` | 1 MiB | File chunk size |
 | `DEFAULT_REPLICATION_FACTOR` | 2 | Normal replicas per chunk |
 | `HOT_REPLICATION_FACTOR` | 3 | Replicas for hot chunks |
-| `HOT_CHUNK_THRESHOLD` | 10 | Accesses to become "hot" |
-| `HEARTBEAT_INTERVAL_SECONDS` | 5 | Node ping interval |
-| `HEARTBEAT_TIMEOUT_SECONDS` | 15 | Time before node is marked dead |
-| `ADAPTIVE_REPLICATION_INTERVAL_SECONDS` | 60 | How often to promote hot chunks |
+| `HOT_CHUNK_THRESHOLD` | 10 | Access threshold for hot chunks |
+| `HEARTBEAT_INTERVAL_SECONDS` | 5 | Node heartbeat interval |
+| `HEARTBEAT_TIMEOUT_SECONDS` | 15 | Failure detection timeout |
+| `ADAPTIVE_REPLICATION_INTERVAL_SECONDS` | 60 | Hot-chunk evaluation interval |
 
----
+Change the values in `common/config.h` and rebuild.
 
 ## Project Structure
 
-```
+```text
 distributed_storage/
-├── proto/                  ← gRPC/Protobuf definitions
-│   ├── metadata.proto      ← Client ↔ Metadata Server
-│   └── storage.proto       ← Metadata Server ↔ Storage Nodes
+├── proto/
+│   ├── metadata.proto          ← Client ↔ Metadata Server
+│   └── storage.proto           ← Storage Node gRPC interface
 ├── common/
-│   ├── config.h            ← All constants
-│   ├── sha256.h / .cpp     ← SHA-256 utility
+│   ├── config.h                ← Configuration constants
+│   └── sha256.h / .cpp         ← SHA-256 utility
 ├── metadata_server/
-│   ├── metadata_db.h/.cpp          ← SQLite wrapper
-│   ├── heartbeat_monitor.h/.cpp    ← Dead node detection
-│   ├── replication_manager.h/.cpp  ← Re-replication + hot promotion
-│   ├── metadata_server.h/.cpp      ← gRPC service
+│   ├── metadata_db.h/.cpp
+│   ├── heartbeat_monitor.h/.cpp
+│   ├── replication_manager.h/.cpp
+│   ├── metadata_server.h/.cpp
 │   └── main.cpp
 ├── storage_node/
-│   ├── chunk_store.h/.cpp          ← Filesystem I/O
-│   ├── heartbeat_sender.h/.cpp     ← Sends pings to metadata server
-│   ├── storage_node_server.h/.cpp  ← gRPC service
+│   ├── chunk_store.h/.cpp
+│   ├── heartbeat_sender.h/.cpp
+│   ├── storage_node_server.h/.cpp
 │   └── main.cpp
 ├── client/
-│   ├── chunker.h/.cpp      ← File splitting
-│   ├── client.h/.cpp       ← PUT/GET/DELETE/LIST
-│   └── main.cpp            ← CLI
+│   ├── chunker.h/.cpp
+│   ├── client.h/.cpp
+│   └── main.cpp
 ├── docker/
 │   ├── Dockerfile.metadata
 │   ├── Dockerfile.storage
@@ -172,33 +428,42 @@ distributed_storage/
 └── CMakeLists.txt
 ```
 
----
+## Technology Stack
 
-## How Fault Tolerance Works
+- **C++17** — core implementation
+- **gRPC** — service-to-service communication
+- **Protocol Buffers** — RPC message definitions
+- **SQLite** — persistent metadata
+- **OpenSSL** — SHA-256 hashing
+- **Docker / Docker Compose** — containerized deployment
+- **CMake** — build system
+- **POSIX filesystem APIs / C++ filesystem** — chunk storage
 
-### Node failure → re-replication
+## Limitations
 
-1. Storage node stops sending heartbeats.
-2. After 15 seconds, `HeartbeatMonitor` detects the timeout.
-3. `ReplicationManager.handleNodeFailure()` is called.
-4. All chunks that were on the dead node are identified.
-5. For each under-replicated chunk: a healthy source node is instructed
-   to copy the chunk to a healthy target node via `CopyChunkTo` gRPC.
-6. The `chunk_locations` table is updated.
+This project intentionally focuses on core distributed-storage concepts and does not implement:
 
-### Adaptive replication (hot chunks)
+- Consensus-based metadata replication such as Raft
+- Erasure coding
+- Distributed metadata across multiple metadata servers
+- Object-storage APIs such as S3
+- FUSE filesystem mounting
+- Kubernetes orchestration
 
-1. Every `GET`, the metadata server increments `access_count` for each chunk.
-2. Every 60 seconds, `ReplicationManager.promoteHotChunks()` runs.
-3. Any chunk with `access_count >= 10` gets promoted to 3 replicas.
-4. The extra replica is added via the same `CopyChunkTo` mechanism.
+The current architecture uses a single metadata server, while storage data is replicated across three storage nodes.
 
----
+## Future Improvements
 
-## SHA-256 Deduplication
+Possible extensions include:
 
-- `chunk_id = SHA-256(chunk data)` — the chunk's name on disk IS its hash.
-- During `PUT`, the client sends SHA-256 hashes to the metadata server.
-- If a hash already exists in the `chunks` table, no upload happens for
-  that chunk — the metadata server just records the new file's association
-  with the existing chunk data.
+- Metadata-server replication
+- Stronger consistency guarantees
+- More sophisticated replica placement
+- Background integrity verification
+- Configurable retry policies
+- Performance benchmarking under larger workloads
+- Additional storage-node failure scenarios
+
+## License
+
+This project is intended as an educational distributed-systems project.
